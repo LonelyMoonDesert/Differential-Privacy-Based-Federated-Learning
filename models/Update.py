@@ -9,19 +9,6 @@ from torch.utils.data import DataLoader, Dataset
 import numpy as np
 import random
 from sklearn import metrics
-from main import setup_privacy_engine
-
-# 动态调整差分隐私的参数
-def adjust_privacy_params(privacy_engine, epoch):
-    if epoch < 5:
-        new_noise_multiplier = 0.25
-    elif epoch < 10:
-        new_noise_multiplier = 0.5
-    else:
-        new_noise_multiplier = 1.0
-    privacy_engine.noise_multiplier = new_noise_multiplier
-    privacy_engine.max_grad_norm = max(1.0 - 0.1 * (epoch // 5), 0.5)
-
 
 class DatasetSplit(Dataset):
     def __init__(self, dataset, idxs):
@@ -64,12 +51,13 @@ class LocalUpdateDP(object):
         elif self.args.dp_mechanism == 'MA':
             return Gaussian_MA(epsilon=self.args.dp_epsilon, delta=self.args.dp_delta, q=self.args.dp_sample, epoch=self.times)
 
-    def train(self, net):
+    def train(self, net, iter, epochs):
         # 训练模型
         net.train()
         optimizer = torch.optim.SGD(net.parameters(), lr=self.lr)  # 使用SGD优化器
         scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1, gamma=self.args.lr_decay)  # 设置学习率衰减
         loss_client = 0
+
         for images, labels in self.ldr_train:
             images, labels = images.to(self.args.device), labels.to(self.args.device)
             net.zero_grad()
@@ -81,7 +69,9 @@ class LocalUpdateDP(object):
             optimizer.step()
             scheduler.step()
             if self.args.dp_mechanism != 'no_dp':
+                self.noise_scale = self.calculate_noise_scale()
                 self.add_noise(net)  # 向参数添加噪声
+                # print("Noise scale: {:.5f},Epsilon: {:.5f},Delta: {:.5f},s".format(self.noise_scale, self.args.dp_epsilon, self.args.dp_delta))
             loss_client = loss.item()
         self.lr = scheduler.get_last_lr()[0]  # 更新学习率
         return net.state_dict(), loss_client
@@ -140,25 +130,24 @@ class LocalUpdateDPSerial(LocalUpdateDP):
         # 调用父类构造函数进行初始化
         super().__init__(args, dataset, idxs)
 
-    def train(self, net, args, iter):
+    def train(self, net, iter, epochs):
         net.train()  # 设置模型为训练模式
         # 初始化优化器和学习率调度器
         optimizer = torch.optim.SGD(net.parameters(), lr=self.lr, momentum=self.args.momentum)
         scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1, gamma=self.args.lr_decay)
 
-        # 根据实验组设置差分隐私
-        if args.group != 'control':
-            privacy_engine = setup_privacy_engine(net, args)
-            privacy_engine.attach(optimizer)  # Attach privacy engine to optimizer
-            if args.group == 'dynamic_dp':
-                adjust_privacy_params(privacy_engine, iter)
-
         losses = 0  # 初始化损失统计
+
+        # 动态调整参数
+        print("epsilon: ", self.args.dp_epsilon)
+        print("delta: ", self.args.dp_delta)
+
         # 遍历数据加载器中的数据
         for images, labels in self.ldr_train:
             net.zero_grad()  # 清除历史梯度
             index = int(len(images) / self.args.serial_bs)  # 计算批次的划分数量
             total_grads = [torch.zeros(size=param.shape).to(self.args.device) for param in net.parameters()]
+
             # 对每个批次进行独立的前向和反向传播
             for i in range(0, index + 1):
                 net.zero_grad()  # 每个小批次开始时清除梯度

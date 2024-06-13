@@ -26,6 +26,7 @@ def args_parser():
     parser.add_argument('--num_classes', type=int, default=10, help="Number of classes in the dataset.")
     parser.add_argument('--num_channels', type=int, default=1, help="Number of channels in images of the dataset.")
     parser.add_argument('--gpu', type=int, default=0, help="GPU ID, -1 for using CPU.")
+    parser.add_argument('--rootpath', type=str, default='./log', help='path to save logs and results')
 
     # Differential privacy arguments
     parser.add_argument('--dp_mechanism', type=str, default='Gaussian', choices=['no_dp', 'Gaussian', 'Laplace', 'MA'],

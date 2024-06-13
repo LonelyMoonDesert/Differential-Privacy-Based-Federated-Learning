@@ -21,6 +21,7 @@ from models.Fed import FedAvg, FedWeightAvg
 from models.test import test_img
 from utils.dataset import FEMNIST, ShakeSpeare
 from opacus.grad_sample import GradSampleModule
+import datetime
 
 from opacus import PrivacyEngine
 
@@ -62,6 +63,10 @@ if __name__ == '__main__':
     args.device = torch.device('cuda:{}'.format(args.gpu) if torch.cuda.is_available() and args.gpu != -1 else 'cpu')
     dict_users = {}
     dataset_train, dataset_test = None, None
+
+    # 获取当前日期时间字符串
+    # current_time = datetime.datetime.now().strftime("%Y%m%d")
+    current_time = time.strftime("%Y%m%d%H%M")
 
     # 根据不同的数据集加载数据并进行用户划分
     if args.dataset == 'mnist':
@@ -148,6 +153,9 @@ if __name__ == '__main__':
         exit('Error: unrecognized model')
 
     # 如果使用差分隐私，使用opacus工具包对模型进行封装
+    if args.group == 'control':
+        args.dp_mechanism = 'no_dp'
+
     if args.dp_mechanism != 'no_dp':
         net_glob = GradSampleModule(net_glob)
     print(net_glob)
@@ -165,13 +173,33 @@ if __name__ == '__main__':
         clients = [LocalUpdateDP(args=args, dataset=dataset_train, idxs=dict_users[i]) for i in range(args.num_users)]
 
 
-
     # 定义数据收集变量
     results = {'accuracy': [], 'privacy_loss': []}
 
-
     # 进行多轮训练
     m, loop_index = max(int(args.frac * args.num_users), 1), int(1 / args.frac)
+    ep = args.dp_epsilon
+    de = args.dp_delta
+
+    # 定义日志文件路径
+    log_file_path = args.rootpath + '/fed_{}_{}_{}_{}_C{}_iid{}_dp_{}_epsilon_{}_{}.log'.format(
+        args.group, args.dataset, args.model, args.epochs, args.frac, args.iid, args.dp_mechanism, ep, current_time)
+
+    # 创建日志文件
+    if not os.path.exists(args.rootpath):
+        os.makedirs(args.rootpath)
+    log_file = open(log_file_path, "w")
+
+    # 替换 print 函数
+    def log_print(*args, **kwargs):
+        print(*args, **kwargs)
+        log_file.write(" ".join(map(str, args)) + "\n")
+
+    # 创建日志文件
+    log_file = open(log_file_path, "w")
+
+    print("DP Mechanism: ", args.dp_mechanism)
+
     for iter in range(args.epochs):
         t_start = time.time()
         w_locals, loss_locals, weight_locols = [], [], []
@@ -180,25 +208,29 @@ if __name__ == '__main__':
         end_index = begin_index + m
         idxs_users = all_clients[begin_index:end_index]
 
-        max_grad_norm = 1.0  # 默认梯度裁剪强度
-        noise_level = 0.1  # 默认噪声水平
-
         if args.group == 'dynamic_dp':
-            # 根据条件动态调整
-            if iter < 5:
-                max_grad_norm = 0.5
-                noise_level = 0.05
-            elif iter < 10:
-                max_grad_norm = 0.8
-                noise_level = 0.08
-            else:
-                max_grad_norm = 1.0
-                noise_level = 0.1
-
+            # 动态调整参数
+            if iter <= int(0.25 * args.epochs):
+                args.dp_epsilon = ep * 2.0
+                args.dp_delta = de * 2.0
+            elif int(0.25 * args.epochs) < iter and iter <=int(0.5 * args.epochs):
+                # 初始阶段，使用较小的噪声
+                args.dp_epsilon = ep * 1.5
+                args.dp_delta = de * 1.5
+            # 如果在第二个阶段
+            elif int(0.5 * args.epochs) < iter and iter <=int(0.75 * args.epochs):
+                # 中期，逐步增加噪声
+                args.dp_epsilon = ep * 1.25
+                args.dp_delta = de * 1.25
+            # 如果在第三个阶段
+            elif int(0.75 * args.epochs) < iter:
+                # 后期，使用最大噪声
+                args.dp_epsilon = ep * 1
+                args.dp_delta = de * 1
 
         for idx in idxs_users:
             local = clients[idx]
-            w, loss = local.train(net=copy.deepcopy(net_glob).to(args.device), args=args, iter=iter)
+            w, loss = local.train(net=copy.deepcopy(net_glob).to(args.device), iter=iter, epochs=args.epochs)
             w_locals.append(copy.deepcopy(w))
             loss_locals.append(copy.deepcopy(loss))
             weight_locols.append(len(dict_users[idx]))
@@ -214,6 +246,23 @@ if __name__ == '__main__':
         t_end = time.time()
         print("Round {:3d},Testing accuracy: {:.2f},Time:  {:.2f}s".format(iter, acc_t, t_end - t_start))
 
+        if args.dp_mechanism != 'no_dp':
+            print("Noise scale: {:.5f},Epsilon: {:.5f},Delta: {:.5f}".format(local.noise_scale, args.dp_epsilon,
+                                                                               args.dp_delta))
+        else:
+            print("Noise scale: NONE, Epsilon: {:.5f}, Delta: {:.5f}".format(args.dp_epsilon, args.dp_delta))
+
+
+
+        log_print("Round {:3d}, Testing accuracy: {:.2f}, Time: {:.2f}s".format(iter, acc_t, t_end - t_start))
+
+        if args.dp_mechanism != 'no_dp':
+            log_print("Noise scale: {:.5f},Epsilon: {:.5f},Delta: {:.5f}".format(local.noise_scale, args.dp_epsilon,
+                                                                               args.dp_delta))
+        else:
+            log_print("Noise scale: NONE, Epsilon: {:.5f}, Delta: {:.5f}".format(args.dp_epsilon, args.dp_delta))
+
+
         results['accuracy'].append(acc_t)
 
         acc_test.append(acc_t.item())
@@ -224,24 +273,26 @@ if __name__ == '__main__':
 
     # 训练完成后，保存结果并绘制性能曲线
     rootpath = './log'
-    if not os.path.exists(rootpath):
-        os.makedirs(rootpath)
-    accfile = open(rootpath + '/accfile_fed_{}_{}_{}_iid{}_dp_{}_epsilon_{}.dat'.
-                   format(args.dataset, args.model, args.epochs, args.iid,
-                          args.dp_mechanism, args.dp_epsilon), "w")
+    # if not os.path.exists(rootpath):
+    #     os.makedirs(rootpath)
+    # accfile = open(rootpath + '/accfile_fed_{}_{}_{}_iid{}_dp_{}_epsilon_{}.dat'.
+    #                format(args.dataset, args.model, args.epochs, args.iid,
+    #                       args.dp_mechanism, args.dp_epsilon), "w")
 
-    for ac in acc_test:
-        sac = str(ac)
-        accfile.write(sac)
-        accfile.write('\n')
-    accfile.close()
+    # for ac in acc_test:
+    #     sac = str(ac)
+    #     accfile.write(sac)
+    #     accfile.write('\n')
+    # accfile.close()
 
     # plot loss curve
     plt.figure()
     plt.plot(range(len(acc_test)), acc_test)
     plt.ylabel('test accuracy')
-    plt.savefig(rootpath + '/fed_{}_{}_{}_C{}_iid{}_dp_{}_epsilon_{}_acc.png'.format(
-        args.dataset, args.model, args.epochs, args.frac, args.iid, args.dp_mechanism, args.dp_epsilon))
+    # plt.savefig(rootpath + '/fed_{}_{}_{}_C{}_iid{}_dp_{}_epsilon_{}_acc.png'.format(
+    #     args.dataset, args.model, args.epochs, args.frac, args.iid, args.dp_mechanism, args.dp_epsilon))
+    plt.savefig(rootpath + '/fed_{}_{}_{}_{}_C{}_iid{}_dp_{}_epsilon_{}_{}.png'.format(
+        args.group, args.dataset, args.model, args.epochs, args.frac, args.iid, args.dp_mechanism, ep, current_time))
 
 
 
